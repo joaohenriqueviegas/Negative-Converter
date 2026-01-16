@@ -1,0 +1,579 @@
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Upload, Download, Loader2, ImageIcon, Sparkles, RotateCcw, Settings, FolderDown } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import EditorControls from '../components/image-editor/EditorControls';
+import KeyboardSettings from '../components/image-editor/KeyboardSettings';
+import ImageGallery from '../components/image-editor/ImageGallery';
+import { encode16BitTIFF, downloadTIFF } from '@/components/utils/tiffEncoder';
+
+const DEFAULT_ADJUSTMENTS = {
+    brightness: 0,
+    exposure: 0,
+    highlights: 0,
+    shadows: 0,
+    red: 0,
+    green: 0,
+    blue: 0,
+};
+
+const DEFAULT_SHORTCUTS = {
+    brightness: { inc1: 'b', inc5: 'B', dec1: 'v', dec5: 'V' },
+    exposure: { inc1: 'e', inc5: 'E', dec1: 'd', dec5: 'D' },
+    highlights: { inc1: 'h', inc5: 'H', dec1: 'g', dec5: 'G' },
+    shadows: { inc1: 's', inc5: 'S', dec1: 'a', dec5: 'A' },
+    red: { inc1: 'r', inc5: 'R', dec1: 'f', dec5: 'F' },
+    green: { inc1: 't', inc5: 'T', dec1: 'y', dec5: 'Y' },
+    blue: { inc1: 'u', inc5: 'U', dec1: 'j', dec5: 'J' },
+    navigation: { prev: 'ArrowLeft', next: 'ArrowRight' },
+};
+
+export default function ImageProcessor() {
+    const [images, setImages] = useState([]);
+    const [currentIndex, setCurrentIndex] = useState(0);
+    const [adjustments, setAdjustments] = useState(DEFAULT_ADJUSTMENTS);
+    const [processedImageUrl, setProcessedImageUrl] = useState(null);
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [isDragging, setIsDragging] = useState(false);
+    const [showSettings, setShowSettings] = useState(false);
+    const [shortcuts, setShortcuts] = useState(DEFAULT_SHORTCUTS);
+    
+    const fileInputRef = useRef(null);
+    const canvasRef = useRef(null);
+    const imageDataRef = useRef(null);
+    const float32DataRef = useRef(null);
+
+    const currentImage = images[currentIndex];
+
+    // 16-bit image processing
+    const processImage16Bit = useCallback((imageData, width, height, adjustments, returnFloat32 = false) => {
+        const data = imageData.data;
+        const float32Data = new Float32Array(data.length);
+        
+        // Convert to 16-bit range (0-65535) stored as floats
+        for (let i = 0; i < data.length; i += 4) {
+            float32Data[i] = (data[i] / 255) * 65535;       // R
+            float32Data[i + 1] = (data[i + 1] / 255) * 65535; // G
+            float32Data[i + 2] = (data[i + 2] / 255) * 65535; // B
+            float32Data[i + 3] = data[i + 3];                 // A (keep 8-bit)
+        }
+        
+        // Step 1: Invert channels
+        for (let i = 0; i < float32Data.length; i += 4) {
+            float32Data[i] = 65535 - float32Data[i];       // R
+            float32Data[i + 1] = 65535 - float32Data[i + 1]; // G
+            float32Data[i + 2] = 65535 - float32Data[i + 2]; // B
+        }
+        
+        // Step 2: Auto-levels based on center 90%
+        const marginX = Math.floor(width * 0.05);
+        const marginY = Math.floor(height * 0.05);
+        const centerWidth = width - (marginX * 2);
+        const centerHeight = height - (marginY * 2);
+        
+        let minR = 65535, minG = 65535, minB = 65535;
+        let maxR = 0, maxG = 0, maxB = 0;
+        
+        for (let y = marginY; y < marginY + centerHeight; y++) {
+            for (let x = marginX; x < marginX + centerWidth; x++) {
+                const idx = (y * width + x) * 4;
+                minR = Math.min(minR, float32Data[idx]);
+                minG = Math.min(minG, float32Data[idx + 1]);
+                minB = Math.min(minB, float32Data[idx + 2]);
+                maxR = Math.max(maxR, float32Data[idx]);
+                maxG = Math.max(maxG, float32Data[idx + 1]);
+                maxB = Math.max(maxB, float32Data[idx + 2]);
+            }
+        }
+        
+        const rangeR = maxR - minR || 1;
+        const rangeG = maxG - minG || 1;
+        const rangeB = maxB - minB || 1;
+        
+        for (let i = 0; i < float32Data.length; i += 4) {
+            float32Data[i] = ((float32Data[i] - minR) / rangeR) * 65535;
+            float32Data[i + 1] = ((float32Data[i + 1] - minG) / rangeG) * 65535;
+            float32Data[i + 2] = ((float32Data[i + 2] - minB) / rangeB) * 65535;
+        }
+        
+        // Step 3: Apply manual adjustments
+        const brightnessMultiplier = 1 + (adjustments.brightness / 100);
+        const exposureMultiplier = Math.pow(2, adjustments.exposure / 100);
+        
+        for (let i = 0; i < float32Data.length; i += 4) {
+            let r = float32Data[i];
+            let g = float32Data[i + 1];
+            let b = float32Data[i + 2];
+            
+            // Calculate luminance for tone adjustments
+            const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 65535;
+            
+            // Brightness
+            r *= brightnessMultiplier;
+            g *= brightnessMultiplier;
+            b *= brightnessMultiplier;
+            
+            // Exposure
+            r *= exposureMultiplier;
+            g *= exposureMultiplier;
+            b *= exposureMultiplier;
+            
+            // Highlights (affect bright areas)
+            if (lum > 0.5) {
+                const highlightFactor = (lum - 0.5) * 2;
+                const highlightAdj = 1 + ((adjustments.highlights / 100) * highlightFactor);
+                r *= highlightAdj;
+                g *= highlightAdj;
+                b *= highlightAdj;
+            }
+            
+            // Shadows (affect dark areas)
+            if (lum < 0.5) {
+                const shadowFactor = (0.5 - lum) * 2;
+                const shadowAdj = 1 + ((adjustments.shadows / 100) * shadowFactor);
+                r *= shadowAdj;
+                g *= shadowAdj;
+                b *= shadowAdj;
+            }
+            
+            // Color balance
+            r *= (1 + adjustments.red / 100);
+            g *= (1 + adjustments.green / 100);
+            b *= (1 + adjustments.blue / 100);
+            
+            // Clamp and store
+            float32Data[i] = Math.min(65535, Math.max(0, r));
+            float32Data[i + 1] = Math.min(65535, Math.max(0, g));
+            float32Data[i + 2] = Math.min(65535, Math.max(0, b));
+        }
+        
+        // Store the 16-bit data for export
+        if (returnFloat32) {
+            return float32Data;
+        }
+        
+        // Convert back to 8-bit for display
+        for (let i = 0; i < data.length; i += 4) {
+            data[i] = Math.round((float32Data[i] / 65535) * 255);
+            data[i + 1] = Math.round((float32Data[i + 1] / 65535) * 255);
+            data[i + 2] = Math.round((float32Data[i + 2] / 65535) * 255);
+        }
+        
+        return imageData;
+    }, []);
+
+    const loadAndProcessImage = useCallback(async (image) => {
+        setIsProcessing(true);
+        
+        const img = new Image();
+        img.onload = () => {
+            const canvas = canvasRef.current;
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            
+            const imgData = ctx.getImageData(0, 0, img.width, img.height);
+            imageDataRef.current = imgData;
+            
+            const processed = processImage16Bit(
+                new ImageData(
+                    new Uint8ClampedArray(imgData.data),
+                    imgData.width,
+                    imgData.height
+                ),
+                img.width,
+                img.height,
+                adjustments
+            );
+            
+            ctx.putImageData(processed, 0, 0);
+            setProcessedImageUrl(canvas.toDataURL('image/png'));
+            setIsProcessing(false);
+        };
+        img.src = image.originalUrl;
+    }, [adjustments, processImage16Bit]);
+
+    useEffect(() => {
+        if (currentImage && imageDataRef.current) {
+            const canvas = canvasRef.current;
+            const ctx = canvas.getContext('2d');
+            
+            // Get 16-bit data for export
+            float32DataRef.current = processImage16Bit(
+                new ImageData(
+                    new Uint8ClampedArray(imageDataRef.current.data),
+                    imageDataRef.current.width,
+                    imageDataRef.current.height
+                ),
+                imageDataRef.current.width,
+                imageDataRef.current.height,
+                adjustments,
+                true // Return float32 data
+            );
+            
+            // Get 8-bit data for display
+            const processed = processImage16Bit(
+                new ImageData(
+                    new Uint8ClampedArray(imageDataRef.current.data),
+                    imageDataRef.current.width,
+                    imageDataRef.current.height
+                ),
+                imageDataRef.current.width,
+                imageDataRef.current.height,
+                adjustments,
+                false
+            );
+            
+            ctx.putImageData(processed, 0, 0);
+            setProcessedImageUrl(canvas.toDataURL('image/png'));
+        }
+    }, [adjustments, processImage16Bit, currentImage]);
+
+    useEffect(() => {
+        if (currentImage) {
+            setAdjustments(currentImage.adjustments || DEFAULT_ADJUSTMENTS);
+            loadAndProcessImage(currentImage);
+        }
+    }, [currentIndex, currentImage?.id]);
+
+    const handleFiles = useCallback(async (fileList) => {
+        const validFiles = Array.from(fileList).filter(file => 
+            file.name.toLowerCase().endsWith('.tiff') || file.name.toLowerCase().endsWith('.tif')
+        );
+        
+        if (validFiles.length === 0) {
+            alert('Please upload TIFF files (.tiff or .tif)');
+            return;
+        }
+        
+        const newImages = await Promise.all(
+            validFiles.map(async (file, index) => {
+                return new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        resolve({
+                            id: Date.now() + index,
+                            name: file.name,
+                            originalUrl: e.target.result,
+                            adjustments: { ...DEFAULT_ADJUSTMENTS },
+                            processed: false,
+                        });
+                    };
+                    reader.readAsDataURL(file);
+                });
+            })
+        );
+        
+        setImages(prev => [...prev, ...newImages]);
+        if (images.length === 0) {
+            setCurrentIndex(0);
+        }
+    }, [images.length]);
+
+    const handleDrop = useCallback((e) => {
+        e.preventDefault();
+        setIsDragging(false);
+        handleFiles(e.dataTransfer.files);
+    }, [handleFiles]);
+
+    const handleDownloadCurrent = useCallback(() => {
+        if (!float32DataRef.current || !canvasRef.current) return;
+        
+        const canvas = canvasRef.current;
+        const baseName = currentImage.name.replace(/\.(tiff?|tif)$/i, '');
+        
+        // Encode as 16-bit TIFF
+        const tiffBuffer = encode16BitTIFF(float32DataRef.current, canvas.width, canvas.height);
+        downloadTIFF(tiffBuffer, `${baseName}_processed.tiff`);
+        
+        setImages(prev => prev.map((img, idx) => 
+            idx === currentIndex ? { ...img, processed: true, adjustments: { ...adjustments } } : img
+        ));
+    }, [currentImage, currentIndex, adjustments]);
+
+    const handleDownloadAll = useCallback(() => {
+        images.forEach((image, index) => {
+            setTimeout(() => {
+                const canvas = document.createElement('canvas');
+                const img = new Image();
+                img.onload = () => {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    
+                    const imgData = ctx.getImageData(0, 0, img.width, img.height);
+                    const float32Data = processImage16Bit(
+                        new ImageData(
+                            new Uint8ClampedArray(imgData.data),
+                            imgData.width,
+                            imgData.height
+                        ),
+                        img.width,
+                        img.height,
+                        image.adjustments,
+                        true // Get 16-bit data
+                    );
+                    
+                    const baseName = image.name.replace(/\.(tiff?|tif)$/i, '');
+                    const tiffBuffer = encode16BitTIFF(float32Data, canvas.width, canvas.height);
+                    downloadTIFF(tiffBuffer, `${baseName}_processed.tiff`);
+                };
+                img.src = image.originalUrl;
+            }, index * 500);
+        });
+    }, [images, processImage16Bit]);
+
+    // Keyboard shortcuts
+    useEffect(() => {
+        const handleKeyPress = (e) => {
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            
+            // Navigation shortcuts
+            if (e.key === shortcuts.navigation?.prev && images.length > 1) {
+                e.preventDefault();
+                setCurrentIndex(prev => prev > 0 ? prev - 1 : images.length - 1);
+                return;
+            }
+            if (e.key === shortcuts.navigation?.next && images.length > 1) {
+                e.preventDefault();
+                setCurrentIndex(prev => prev < images.length - 1 ? prev + 1 : 0);
+                return;
+            }
+            
+            // Adjustment shortcuts
+            Object.entries(shortcuts).forEach(([control, keys]) => {
+                if (control === 'navigation') return;
+                
+                if (keys.inc1 === e.key) {
+                    e.preventDefault();
+                    setAdjustments(prev => ({
+                        ...prev,
+                        [control]: Math.min(200, prev[control] + 1)
+                    }));
+                } else if (keys.inc5 === e.key) {
+                    e.preventDefault();
+                    setAdjustments(prev => ({
+                        ...prev,
+                        [control]: Math.min(200, prev[control] + 5)
+                    }));
+                } else if (keys.dec1 === e.key) {
+                    e.preventDefault();
+                    setAdjustments(prev => ({
+                        ...prev,
+                        [control]: Math.max(-200, prev[control] - 1)
+                    }));
+                } else if (keys.dec5 === e.key) {
+                    e.preventDefault();
+                    setAdjustments(prev => ({
+                        ...prev,
+                        [control]: Math.max(-200, prev[control] - 5)
+                    }));
+                }
+            });
+        };
+
+        window.addEventListener('keydown', handleKeyPress);
+        return () => window.removeEventListener('keydown', handleKeyPress);
+    }, [shortcuts, images.length]);
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
+            <canvas ref={canvasRef} className="hidden" />
+            
+            <header className="border-b border-slate-800/50 backdrop-blur-xl bg-slate-950/50 sticky top-0 z-10">
+                <div className="max-w-[1800px] mx-auto px-6 py-4 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
+                            <Sparkles className="w-5 h-5 text-white" />
+                        </div>
+                        <div>
+                            <h1 className="text-xl font-semibold text-white tracking-tight">TIFF Inverter Pro</h1>
+                            <p className="text-xs text-slate-500">16-bit Processing • Batch Support</p>
+                        </div>
+                    </div>
+                    
+                    <div className="flex gap-3">
+                        <Button
+                            variant="outline"
+                            onClick={() => setShowSettings(true)}
+                            className="bg-slate-800 border-slate-700 hover:bg-slate-700 text-white"
+                        >
+                            <Settings className="w-4 h-4 mr-2" />
+                            Shortcuts
+                        </Button>
+                        
+                        {images.length > 0 && (
+                            <>
+                                {images.length > 1 && (
+                                    <Button
+                                        onClick={handleDownloadAll}
+                                        variant="outline"
+                                        className="bg-slate-800 border-slate-700 hover:bg-slate-700 text-white"
+                                    >
+                                        <FolderDown className="w-4 h-4 mr-2" />
+                                        Download All
+                                    </Button>
+                                )}
+                                <Button
+                                    onClick={handleDownloadCurrent}
+                                    disabled={!processedImageUrl}
+                                    className="bg-gradient-to-r from-blue-500 to-violet-600 hover:from-blue-600 hover:to-violet-700 text-white shadow-lg shadow-blue-500/25"
+                                >
+                                    <Download className="w-4 h-4 mr-2" />
+                                    Export Current
+                                </Button>
+                            </>
+                        )}
+                    </div>
+                </div>
+            </header>
+
+            <main className="max-w-[1800px] mx-auto">
+                <AnimatePresence mode="wait">
+                    {images.length === 0 ? (
+                        <motion.div
+                            key="upload"
+                            initial={{ opacity: 0, y: 20 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -20 }}
+                            className="px-6 py-12 flex flex-col items-center justify-center"
+                        >
+                            <div
+                                onDrop={handleDrop}
+                                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                                onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+                                onClick={() => fileInputRef.current?.click()}
+                                className={`
+                                    w-full max-w-2xl aspect-[4/3] rounded-3xl border-2 border-dashed 
+                                    transition-all duration-300 cursor-pointer
+                                    flex flex-col items-center justify-center gap-6
+                                    ${isDragging 
+                                        ? 'border-blue-500 bg-blue-500/10 scale-[1.02]' 
+                                        : 'border-slate-700 hover:border-slate-600 bg-slate-900/50 hover:bg-slate-900'
+                                    }
+                                `}
+                            >
+                                <div className={`
+                                    w-20 h-20 rounded-2xl flex items-center justify-center transition-all duration-300
+                                    ${isDragging ? 'bg-blue-500/20' : 'bg-slate-800'}
+                                `}>
+                                    <Upload className={`w-8 h-8 transition-colors ${isDragging ? 'text-blue-400' : 'text-slate-500'}`} />
+                                </div>
+                                <div className="text-center">
+                                    <p className="text-lg text-slate-300 font-medium">
+                                        Drop TIFF files here
+                                    </p>
+                                    <p className="text-sm text-slate-500 mt-1">
+                                        or click to browse • Multiple files supported
+                                    </p>
+                                </div>
+                            </div>
+                            
+                            <input
+                                ref={fileInputRef}
+                                type="file"
+                                accept=".tiff,.tif"
+                                multiple
+                                onChange={(e) => handleFiles(e.target.files)}
+                                className="hidden"
+                            />
+                        </motion.div>
+                    ) : (
+                        <motion.div
+                            key="editor"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            className="grid grid-cols-1 lg:grid-cols-[1fr,320px] min-h-[calc(100vh-73px)]"
+                        >
+                            <div className="flex flex-col">
+                                <div className="flex-1 p-6">
+                                    <div className="flex items-center gap-3 mb-6">
+                                        <div className="w-10 h-10 rounded-xl bg-slate-800 flex items-center justify-center">
+                                            <ImageIcon className="w-5 h-5 text-slate-400" />
+                                        </div>
+                                        <div>
+                                            <p className="text-white font-medium">{currentImage?.name}</p>
+                                            <p className="text-xs text-slate-500">
+                                                Image {currentIndex + 1} of {images.length}
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                                        <Card className="bg-slate-900/50 border-slate-800 overflow-hidden">
+                                            <div className="px-5 py-4 border-b border-slate-800">
+                                                <span className="text-sm font-medium text-slate-400">Original</span>
+                                            </div>
+                                            <div className="p-4">
+                                                <div className="relative aspect-video rounded-xl overflow-hidden bg-slate-950 flex items-center justify-center">
+                                                    {currentImage && (
+                                                        <img 
+                                                            src={currentImage.originalUrl} 
+                                                            alt="Original" 
+                                                            className="max-w-full max-h-full object-contain"
+                                                        />
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </Card>
+
+                                        <Card className="bg-slate-900/50 border-slate-800 overflow-hidden">
+                                            <div className="px-5 py-4 border-b border-slate-800">
+                                                <span className="text-sm font-medium text-slate-400">Processed (16-bit)</span>
+                                            </div>
+                                            <div className="p-4">
+                                                <div className="relative aspect-video rounded-xl overflow-hidden bg-slate-950 flex items-center justify-center">
+                                                    {isProcessing ? (
+                                                        <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
+                                                    ) : processedImageUrl ? (
+                                                        <img 
+                                                            src={processedImageUrl} 
+                                                            alt="Processed" 
+                                                            className="max-w-full max-h-full object-contain"
+                                                        />
+                                                    ) : null}
+                                                </div>
+                                            </div>
+                                        </Card>
+                                    </div>
+                                </div>
+
+                                <ImageGallery
+                                    images={images}
+                                    currentIndex={currentIndex}
+                                    onSelectImage={setCurrentIndex}
+                                    onRemoveImage={(index) => {
+                                        setImages(prev => prev.filter((_, i) => i !== index));
+                                        if (currentIndex >= images.length - 1) {
+                                            setCurrentIndex(Math.max(0, images.length - 2));
+                                        }
+                                    }}
+                                />
+                            </div>
+
+                            <div className="border-l border-slate-800 bg-slate-900/30 p-6 overflow-y-auto">
+                                <EditorControls
+                                    adjustments={adjustments}
+                                    onAdjustmentChange={(key, value) => {
+                                        setAdjustments(prev => ({ ...prev, [key]: value }));
+                                    }}
+                                    shortcuts={shortcuts}
+                                />
+                            </div>
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+            </main>
+
+            <KeyboardSettings
+                open={showSettings}
+                onClose={() => setShowSettings(false)}
+                shortcuts={shortcuts}
+                onShortcutsChange={setShortcuts}
+            />
+        </div>
+    );
+}
